@@ -8,7 +8,7 @@
   "permissions": ["storage"],
   "content_scripts": [
     {
-      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "matches": ["https://x.com/*", "https://twitter.com/*", "https://pro.x.com/*"],
       "js": ["x.js"],
       "run_at": "document_idle"
     }
