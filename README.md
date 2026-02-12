@@ -16,7 +16,7 @@
 ## 开发信息
 - **作者**: pingoo
 - **网址**: [https://pingoo.trade](https://pingoo.trade)
-- **平台**: 专为 Trae 设计
+- **平台**: 专为 Trade 设计
 
 ## 许可证
 MIT License
