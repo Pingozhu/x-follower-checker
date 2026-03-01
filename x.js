@@ -5,9 +5,10 @@
     console.log("🚀 X 关注状态检测助手 v1.10 已启动... (X Follower Checker started...)");
 
     let relationshipCache = {};
-    let globalReplyMode = 'simple'; // 全局回复模式 (Global reply mode: simple | content)
+    let globalReplyMode = 'simple'; // 全局回复模式 (Global reply mode: simple | content | custom)
     let isFilling = false; // 填充忙碌锁 (Filling concurrency lock)
     let isFilterActive = false; // 筛选状态 (Filter active state)
+    let customReplies = []; // 自定义回复内容库 (Custom reply content pool)
 
     // 预设回复模板 (Preset reply templates) - 简单版 (Simple)
     const templatesSimple = [
@@ -126,7 +127,18 @@
         // 500ms 锁定，防止快速双击或重复触发 (500ms lock to prevent double-click or multiple triggers)
         setTimeout(() => { isFilling = false; }, 500);
 
-        const pool = globalReplyMode === 'content' ? templatesDetailed : templatesSimple;
+        let pool = [];
+        if (globalReplyMode === 'content') {
+            pool = templatesDetailed;
+        } else if (globalReplyMode === 'custom') {
+            pool = customReplies.length > 0 ? customReplies : templatesSimple;
+            if (customReplies.length === 0) {
+                console.log("⚠️ Custom replies empty, falling back to simple templates");
+            }
+        } else {
+            pool = templatesSimple;
+        }
+
         let text = pool[Math.floor(Math.random() * pool.length)];
 
         // 终极内容与标签分离处理逻辑 / Ultimate Content & Tag Separation Logic
@@ -362,13 +374,17 @@
 
     // 更新所有模式按钮的 UI / Update all mode buttons UI
     const updateModeButtonsUI = () => {
-        const isContent = globalReplyMode === 'content';
         document.querySelectorAll('.x-reply-mode-btn').forEach(btn => {
-            btn.textContent = isContent ? '内容' : '简单';
-            if (isContent) {
+            if (globalReplyMode === 'content') {
+                btn.textContent = '内容';
                 btn.style.background = 'rgb(29, 155, 240)';
                 btn.style.color = 'white';
+            } else if (globalReplyMode === 'custom') {
+                btn.textContent = '自定义';
+                btn.style.background = 'rgb(128, 0, 128)'; // 紫罗兰色以区分 (Purple to distinguish)
+                btn.style.color = 'white';
             } else {
+                btn.textContent = '简单';
                 btn.style.background = 'rgba(29, 155, 240, 0.1)';
                 btn.style.color = 'rgb(29, 155, 240)';
             }
@@ -401,12 +417,16 @@
             modeBtn.style.justifyContent = 'center';
 
             // 立即根据全局状态同步样式 (Sync style immediately based on global state)
-            const isContent = globalReplyMode === 'content';
-            modeBtn.textContent = isContent ? '内容' : '简单';
-            if (isContent) {
+            if (globalReplyMode === 'content') {
+                modeBtn.textContent = '内容';
                 modeBtn.style.background = 'rgb(29, 155, 240)';
                 modeBtn.style.color = 'white';
+            } else if (globalReplyMode === 'custom') {
+                modeBtn.textContent = '自定义';
+                modeBtn.style.background = 'rgb(128, 0, 128)';
+                modeBtn.style.color = 'white';
             } else {
+                modeBtn.textContent = '简单';
                 modeBtn.style.background = 'rgba(29, 155, 240, 0.1)';
                 modeBtn.style.color = 'rgb(29, 155, 240)';
             }
@@ -414,7 +434,15 @@
             modeBtn.onclick = (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                globalReplyMode = globalReplyMode === 'simple' ? 'content' : 'simple';
+
+                // 三重状态循环 (Triple state cycle)
+                if (globalReplyMode === 'simple') {
+                    globalReplyMode = 'content';
+                } else if (globalReplyMode === 'content') {
+                    globalReplyMode = 'custom';
+                } else {
+                    globalReplyMode = 'simple';
+                }
 
                 // 同步更新页面上所有模式按钮 (Sync all mode buttons on page)
                 updateModeButtonsUI();
@@ -502,15 +530,27 @@
     // 从存储中加载缓存 / Load cache from storage
     try {
         if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-            chrome.storage.local.get(['relationshipCache'], (result) => {
+            chrome.storage.local.get(['relationshipCache', 'customReplies'], (result) => {
                 try {
                     if (result && result.relationshipCache) {
                         relationshipCache = result.relationshipCache;
                         console.log("📦 Loaded cache:", Object.keys(relationshipCache).length, "users");
                         updateAllLabels();
                     }
+                    if (result && Array.isArray(result.customReplies)) {
+                        customReplies = result.customReplies;
+                        console.log("📦 Loaded custom replies:", customReplies.length, "items");
+                    }
                 } catch (e) {
                     console.log("⚠️ Failed to process loaded cache");
+                }
+            });
+
+            // 监听存储变化，支持插件弹窗即时修改生效 (Listen to storage changes for popup updates)
+            chrome.storage.onChanged.addListener((changes, namespace) => {
+                if (namespace === 'local' && changes.customReplies) {
+                    customReplies = changes.customReplies.newValue || [];
+                    console.log("🔄 Custom replies updated from storage:", customReplies.length, "items");
                 }
             });
         }
