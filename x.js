@@ -2,13 +2,21 @@
     if (window.hasRunXAssistant) return;
     window.hasRunXAssistant = true;
 
-    console.log("🚀 X 关注状态检测助手 v1.10 已启动... (X Follower Checker started...)");
+    console.log("🚀 X 关注状态检测助手 v2.8.2 已启动 (fetch拦截模式 + 动态主动拉取补充)... (X Follower Checker v2.8.2 started - fetch intercept + active fallback)");
 
     let relationshipCache = {};
     let globalReplyMode = 'simple'; // 全局回复模式 (Global reply mode: simple | content | custom)
     let isFilling = false; // 填充忙碌锁 (Filling concurrency lock)
     let isFilterActive = false; // 筛选状态 (Filter active state)
+    let isApplyingFilter = false; // 防止 observer 在筛选操作期间触发循环 (Prevent observer loop during filter ops)
+    let notFollowingBackSet = new Set(); // 累积记录所有未回粉用户 handle（跨虚拟滚动批次）/ Accumulate non-follower handles across virtual scroll batches
     let customReplies = []; // 自定义回复内容库 (Custom reply content pool)
+
+    // === 动态补充标签相关 (Active Fetch Fallback) ===
+    let pendingFetchQueue = new Set(); // 那些需要主动发送 API 请求的 handle (handles pending API request)
+    let failedFetchSet = new Set(); // 标记查询失败的用户，避免限流时反复循环查询，也不要写缓存覆盖原本状态
+    let isFetchingAPI = false;
+    let viewportObserver = null;
 
     // 预设回复模板 (Preset reply templates) - 简单版 (Simple)
     const templatesSimple = [
@@ -569,8 +577,137 @@
         }
     };
 
-    // 获取用户 handle / Get user handle
-    const getHandle = (container) => {
+    // ─── 监听来自 interceptor.js 的关注关系数据 ────────────────
+    // Listen for follow relationship data from interceptor.js (MAIN world → ISOLATED world)
+    //
+    // interceptor.js 在 document_start + world:MAIN 运行，拦截 X 自有 GraphQL 响应，
+    // 从 legacy.following / legacy.followed_by 中提取关注状态，通过 postMessage 传过来。
+    //
+    // interceptor.js runs at document_start in MAIN world, intercepts X's own GraphQL
+    // responses, extracts following/followed_by from legacy objects, and passes via postMessage.
+    window.addEventListener('message', (e) => {
+        if (e.source !== window) return;
+        if (!e.data || e.data.type !== 'X_FOLLOW_STATUS') return;
+
+        const { handle, following, followedBy } = e.data;
+        if (!handle) return;
+
+        // 根据 following / followedBy 决定状态
+        // Determine status from following / followedBy flags
+        let status;
+        if (following && followedBy) {
+            status = 'mutual';         // 双向关注 / Mutual follow
+        } else if (following && !followedBy) {
+            status = 'not_following_back'; // 我关注他，他没回 / I follow, they don't
+        } else if (!following && followedBy) {
+            status = 'following_me';   // 他关注我，我没回关 / They follow me, I don't
+        } else {
+            status = 'none';           // 无关注关系 / No follow relationship
+        }
+
+        const handleLower = handle.toLowerCase();
+
+        // 只在状态变化时更新，避免不必要的 DOM 操作
+        // Only update when status changes, avoid unnecessary DOM operations
+        const currentStatus = relationshipCache[handleLower] || relationshipCache[handle];
+        if (currentStatus === status) return;
+
+        // 同时用小写和原始大小写存储，兼容不同的查找方式
+        // Store with both lowercase and original case for lookup compatibility
+        relationshipCache[handle] = status;
+        relationshipCache[handleLower] = status;
+
+        console.log(`[X-Interceptor→x.js] @${handle}: ${status}`);
+
+        // 立即刷新页面上所有推文的标签 / Immediately refresh labels on all tweets
+        // 只需对该用户的推文实时更新，减少 DOM 遍历开销
+        // Only need to update tweets from this user, reduce DOM traversal cost
+        const tweets = document.querySelectorAll('[data-testid="tweet"]');
+        tweets.forEach(tweet => {
+            const tweetHandle = getHandle(tweet, true);
+            if (!tweetHandle) return;
+            if (tweetHandle.toLowerCase() !== handleLower) return;
+
+            if (status && status !== 'none' && status !== 'following_me') {
+                createOrUpdateLabel(tweet, status, false);
+            } else if (status === 'none') {
+                // If status is 'none', ensure no label is shown
+                createOrUpdateLabel(tweet, 'none', false);
+            }
+        });
+
+        // 同时更新 UserCell（关注列表）/ Also update UserCell (following list)
+        const userCells = document.querySelectorAll('[data-testid="UserCell"]');
+        userCells.forEach(cell => {
+            const cellHandle = getHandle(cell);
+            if (!cellHandle) return;
+            if (cellHandle.toLowerCase() !== handleLower) return;
+            createOrUpdateLabel(cell, status, true);
+        });
+
+        // 延迟持久化，批量写入减少存储 I/O
+        // Debounced persist to reduce storage I/O with batching
+        saveCache();
+    });
+
+    // 获取用户 handle（兼容推文和用户卡片）/ Get user handle (tweet & user cell compatible)
+    const getHandle = (container, isTweet = false) => {
+        if (isTweet) {
+            // 推文场景：提取推文作者 handle
+            // Tweet scenario: extract tweet AUTHOR handle
+            //
+            // 策略：先用 User-Names 里的 @span（最精确），失败再用链接兜底
+            // Strategy: @span in User-Names first (most accurate), then link fallback
+            //
+            // 注：不用 closest('[data-testid="tweet"]') 做守门——X 不同布局下
+            //     data-testid="tweet" 所在层次不固定，closest() 比较容易误判导致返回 null
+            // Note: Avoid using closest('[data-testid="tweet"]') as a gate — X's layout
+            //       varies and the testid level is inconsistent, causing false nulls.
+
+            // 1. 找第一个 User-Names 内所有含 @ 的 span，取最短（最精确）的
+            //    Find all @-prefixed spans in the first User-Names; pick shortest (most precise)
+            const authorZone = container.querySelector('[data-testid="User-Names"]');
+            if (authorZone) {
+                const spans = Array.from(authorZone.querySelectorAll('span'));
+                // 找所有以 @ 开头、且只含 handle 字符的 span（避免取到包含子文本的父 span）
+                // Find spans starting with @ and containing only handle characters
+                const handleSpans = spans.filter(s => {
+                    const t = s.textContent.trim();
+                    return t.startsWith('@') && /^@\w+$/.test(t);
+                });
+                if (handleSpans.length > 0) {
+                    // 取最短的（最精确，排除父 span 包含更多文字的情况）
+                    handleSpans.sort((a, b) => a.textContent.length - b.textContent.length);
+                    return handleSpans[0].textContent.trim().slice(1);
+                }
+
+                // 2. 从 authorZone 内的链接提取（如 /username 形式）
+                //    Extract from link inside authorZone (e.g. /username)
+                const links = Array.from(authorZone.querySelectorAll('a[href^="/"]'));
+                for (const link of links) {
+                    const path = link.getAttribute('href').slice(1).split('/')[0];
+                    if (path && !['home', 'explore', 'notifications', 'messages', 'i', 'search', 'settings'].includes(path)) {
+                        return path;
+                    }
+                }
+            }
+
+            // 3. 终极兜底：扫描整个 container 内第一个合法用户链接
+            //    Ultimate fallback: scan container for first valid user link
+            //    （与旧版 getHandle 逻辑相同，保持缓存查询兼容性）
+            //    (Same as old getHandle logic, maintains cache lookup compatibility)
+            const profileLinks = Array.from(container.querySelectorAll('a[role="link"][href^="/"]'));
+            for (const link of profileLinks) {
+                const path = link.getAttribute('href').slice(1);
+                if (!['home', 'explore', 'notifications', 'messages', 'i', 'search', 'settings'].includes(path.split('/')[0])) {
+                    return path.split('/')[0];
+                }
+            }
+
+            return null;
+        }
+
+        // UserCell 场景 / UserCell scenario
         // 1. 从 User-Names 的第二个 span 获取 / Get from second span in User-Names
         const handleSpan = container.querySelector('[data-testid="User-Names"] span:nth-child(2)');
         if (handleSpan && handleSpan.textContent.startsWith('@')) {
@@ -589,6 +726,70 @@
         // 3. 正则匹配 / Regex match
         const handleMatch = container.innerText.match(/@(\w+)/);
         return handleMatch ? handleMatch[1] : null;
+    };
+
+    // 从推文 DOM 主动推断关注状态（不依赖缓存）
+    // Infer follow status directly from tweet DOM (no cache dependency)
+    const inferStatusFromTweetDOM = (tweet) => {
+        // 策略 1: 作者 User-Names 区域是否有「关注了你」标签
+        // Strategy 1: Check for "Follows you" badge in author's User-Names zone
+        const authorZone = tweet.querySelector('[data-testid="User-Names"]');
+        if (authorZone) {
+            const nestedTweet = authorZone.closest('[data-testid="tweet"]');
+            if (!nestedTweet || nestedTweet === tweet) {
+                const spans = Array.from(authorZone.querySelectorAll('span'));
+                const followsYou = spans.some(s =>
+                    s.textContent.includes('关注了你') ||
+                    s.textContent.includes('Follows you')
+                );
+                if (followsYou) {
+                    // 再判断我是否关注了他 / Also check if I follow them
+                    const headerArea = authorZone.parentElement?.parentElement;
+                    if (headerArea) {
+                        const followBtn = headerArea.querySelector('button[data-testid$="-follow"]');
+                        if (followBtn) {
+                            const btnSpans = Array.from(followBtn.querySelectorAll('span'));
+                            const iAmFollowing = btnSpans.some(s =>
+                                s.textContent.trim() === '正在关注' ||
+                                s.textContent.trim() === 'Following'
+                            );
+                            return iAmFollowing ? 'mutual' : 'following_me';
+                        }
+                    }
+                    // 找不到按钮但有「关注了你」，暂归 following_me
+                    return 'following_me';
+                }
+            }
+        }
+
+        // 策略 2: 推文顶部关注按钮文字判断
+        // Strategy 2: Read follow button text near tweet header
+        //
+        // 只找属于当前 tweet（非嵌套引用推文）的按钮
+        // Only find buttons belonging to this tweet (not nested quoted tweet)
+        const allFollowBtns = Array.from(tweet.querySelectorAll('button[data-testid$="-follow"]'));
+        const topFollowBtn = allFollowBtns.find(btn => {
+            const nestedTweet = btn.closest('[data-testid="tweet"]');
+            return !nestedTweet || nestedTweet === tweet;
+        });
+
+        if (topFollowBtn) {
+            const btnSpans = Array.from(topFollowBtn.querySelectorAll('span'));
+            const isFollowing = btnSpans.some(s =>
+                s.textContent.trim() === '正在关注' ||
+                s.textContent.trim() === 'Following'
+            );
+            const isNotFollowing = btnSpans.some(s =>
+                s.textContent.trim() === '关注' ||
+                s.textContent.trim() === 'Follow'
+            );
+            // 我正在关注他（但不确定他是否关注我）
+            if (isFollowing) return 'following';
+            // 我没有关注他，无需标注
+            if (isNotFollowing) return null;
+        }
+
+        return null; // 无法判断，跳过 / Cannot determine, skip
     };
 
     // 创建或更新标签 / Create or update label
@@ -669,82 +870,118 @@
         label.style.backgroundColor = bgColor;
     };
 
-    // 注入筛选按钮 / Inject filter button
+    // 注入筛选按钮（悬浮固定位，不注入 tablist 避免触发 X 路由重置）
+    // Inject filter button as a FIXED FLOATING button — NOT into tablist to avoid X router scroll reset
     const injectFilterButton = () => {
-        // 扩展支持包含 followers 的页面 (Expand to support pages including followers)
         const path = window.location.pathname.toLowerCase();
         const isFollowPage = path.endsWith('/following') ||
             path.endsWith('/followers') ||
             path.endsWith('/verified_followers');
 
-        if (!isFollowPage) return;
+        // 离开关注页：隐藏按钮 / Not on follow page: hide button
+        const existing = document.getElementById('x-float-filter-btn');
+        if (!isFollowPage) {
+            if (existing) existing.style.display = 'none';
+            return;
+        }
 
-        const tabList = document.querySelector('[role="tablist"]');
-        if (!tabList || tabList.querySelector('.x-filter-follows-btn')) return;
+        // 已注入过：直接同步状态后返回 / Already injected: just sync state and return
+        if (existing) {
+            existing.style.display = 'flex';
+            // 同步颜色状态 / Sync color state
+            const textEl = existing.querySelector('.x-filter-follows-text');
+            if (textEl) {
+                const count = notFollowingBackSet.size;
+                textEl.textContent = count > 0 ? `未回粉 ${count}人` : '未回粉';
+            }
+            const iconEl = existing.querySelector('.x-filter-icon');
+            if (iconEl) {
+                existing.style.background = isFilterActive
+                    ? 'rgb(29, 155, 240)'
+                    : 'rgba(29, 155, 240, 0.15)';
+                iconEl.style.color = isFilterActive ? '#fff' : 'rgb(29, 155, 240)';
+            }
+            return;
+        }
 
-        const btn = document.createElement('div');
-        btn.className = 'x-filter-follows-btn';
-        btn.setAttribute('role', 'tab');
-        btn.style.flexGrow = '1';
-        btn.style.display = 'flex';
-        btn.style.alignItems = 'center';
-        btn.style.justifyContent = 'center';
-        btn.style.cursor = 'pointer';
-        btn.style.userSelect = 'none';
-        btn.style.transition = 'background-color 0.2s';
-        btn.style.padding = '0 16px';
-        btn.style.minWidth = '56px';
+        // 首次注入：创建悬浮按钮 / First inject: create floating button
+        const floatBtn = document.createElement('div');
+        floatBtn.id = 'x-float-filter-btn';
+        floatBtn.style.cssText = `
+            position: fixed;
+            bottom: 80px;
+            right: 16px;
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+            cursor: pointer;
+            user-select: none;
+        `;
 
-        const inner = document.createElement('div');
-        inner.style.display = 'flex';
-        inner.style.alignItems = 'center';
-        inner.style.justifyContent = 'center';
-        inner.style.height = '100%';
-        inner.style.position = 'relative';
+        const pill = document.createElement('div');
+        pill.style.cssText = `
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 14px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: bold;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+            transition: background 0.2s, transform 0.1s;
+            background: ${isFilterActive ? 'rgb(29, 155, 240)' : 'rgba(29, 155, 240, 0.15)'};
+            border: 1.5px solid rgb(29, 155, 240);
+        `;
 
-        const text = document.createElement('span');
-        text.className = 'x-filter-follows-text';
-        text.textContent = '未回粉';
-        text.style.fontSize = '15px';
-        text.style.fontWeight = 'bold';
-        // 使用 CSS 变量自适应主题，回退到适合黑暗模式的默认色 (Use CSS variables for theme adaptation)
-        text.style.color = isFilterActive ? 'var(--color-text-primary, #e7e9ea)' : 'var(--color-text-secondary, #71767b)';
+        const icon = document.createElement('span');
+        icon.className = 'x-filter-icon';
+        icon.textContent = '🔍';
+        icon.style.cssText = `
+            font-size: 14px;
+            color: ${isFilterActive ? '#fff' : 'rgb(29, 155, 240)'};
+        `;
 
-        const line = document.createElement('div');
-        line.style.position = 'absolute';
-        line.style.bottom = '0';
-        line.style.height = '4px';
-        line.style.minWidth = '56px';
-        line.style.width = '100%';
-        line.style.borderRadius = '9999px';
-        line.style.backgroundColor = isFilterActive ? 'var(--color-primary, rgb(29, 155, 240))' : 'transparent';
+        const label = document.createElement('span');
+        label.className = 'x-filter-follows-text';
+        label.style.cssText = `
+            color: ${isFilterActive ? '#fff' : 'rgb(29, 155, 240)'};
+            line-height: 1;
+        `;
+        const initCount = notFollowingBackSet.size;
+        label.textContent = initCount > 0 ? `未回粉 ${initCount}人` : '未回粉';
 
-        inner.appendChild(text);
-        inner.appendChild(line);
-        btn.appendChild(inner);
+        pill.appendChild(icon);
+        pill.appendChild(label);
+        floatBtn.appendChild(pill);
+        document.body.appendChild(floatBtn);
 
-        btn.onclick = (e) => {
+        floatBtn.onclick = (e) => {
             e.preventDefault();
             e.stopPropagation();
             isFilterActive = !isFilterActive;
-            console.log(`🔍 Filter "Not Following Back" toggled: ${isFilterActive}`);
+            console.log(`🔍 Filter toggled: ${isFilterActive}`);
 
-            // 更新 UI (Update UI)
-            text.style.color = isFilterActive ? 'var(--color-text-primary, #e7e9ea)' : 'var(--color-text-secondary, #71767b)';
-            line.style.backgroundColor = isFilterActive ? 'var(--color-primary, rgb(29, 155, 240))' : 'transparent';
+            pill.style.background = isFilterActive ? 'rgb(29, 155, 240)' : 'rgba(29, 155, 240, 0.15)';
+            icon.style.color = isFilterActive ? '#fff' : 'rgb(29, 155, 240)';
+            label.style.color = isFilterActive ? '#fff' : 'rgb(29, 155, 240)';
+            pill.style.transform = 'scale(0.95)';
+            setTimeout(() => { pill.style.transform = 'scale(1)'; }, 120);
 
-            // 立即应用筛选 (Apply filter immediately)
-            applyFollowerFilter();
+            isApplyingFilter = true;
+            observer.disconnect();
+            observer.takeRecords();
+            try {
+                applyFollowerFilter();
+            } finally {
+                isApplyingFilter = false;
+                observer.observe(document.body, { childList: true, subtree: true });
+            }
         };
 
-        btn.onmouseover = () => {
-            btn.style.backgroundColor = 'rgba(var(--rgb-text-primary, 15, 20, 25), 0.1)';
-        };
-        btn.onmouseout = () => {
-            btn.style.backgroundColor = 'transparent';
-        };
-
-        tabList.appendChild(btn);
+        floatBtn.onmouseover = () => { pill.style.transform = 'scale(1.05)'; };
+        floatBtn.onmouseout = () => { pill.style.transform = 'scale(1)'; };
     };
 
     // 注入提醒按钮 / Inject Nudge button
@@ -809,59 +1046,283 @@
         actionArea.prepend(nudgeBtn);
     };
 
+    // 注入筛选样式（只注入一次）/ Inject filter styles (once only)
+    const injectFilterStyles = () => {
+        if (document.getElementById('x-filter-styles')) return;
+        const style = document.createElement('style');
+        style.id = 'x-filter-styles';
+        // 用 max-height 动画代替 display:none，避免触发 X 虚拟列表的位置重置
+        // Use max-height animation instead of display:none to avoid X virtual list position reset
+        style.textContent = `
+            [data-testid="UserCell"].x-filtered-out {
+                max-height: 0 !important;
+                overflow: hidden !important;
+                opacity: 0 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                pointer-events: none !important;
+                /* 不用 display:none，保持元素在DOM流中，X虚拟列表不会感知到元素消失 */
+                /* DON'T use display:none - keep in DOM flow so X's virtual list won't detect disappearance */
+            }
+        `;
+        document.head.appendChild(style);
+    };
+
     // 应用关注者筛选 / Apply follower filter
     const applyFollowerFilter = () => {
+        injectFilterStyles();
+
         const userCells = document.querySelectorAll('[data-testid="UserCell"]');
-        let nonFollowerCount = 0;
 
         userCells.forEach(cell => {
             const handle = getHandle(cell);
-            const spans = Array.from(cell.querySelectorAll('span'));
 
-            // 检查是否有"正在关注"按钮 (Check if I am following this user)
-            const isFollowing = spans.some(
-                el => el.textContent.trim() === '正在关注' ||
-                    el.textContent.trim() === 'Following'
-            );
+            // ── 判断关注关系：缓存优先，DOM span 兜底 ──────────────
+            // Determine follow relationship: cache first, DOM span as fallback
+            let isMutual = false;
+            let iAmFollowing = false;
 
-            // 检查是否有"关注了你"标签 (Check for "Follows you" label)
-            const followsYou = spans.some(
-                el => el.textContent.includes('关注了你') ||
-                    el.textContent.includes('Follows you')
-            );
-
-            if (!followsYou) {
-                nonFollowerCount++;
-                // 只有在我关注了对方，且对方未回粉的情况下才显示提醒按钮 (Only show nudge if I follow them and they don't follow back)
-                if (handle && isFollowing) {
-                    injectNudgeButton(cell, handle);
-                } else {
-                    const existingNudge = cell.querySelector('.x-nudge-btn');
-                    if (existingNudge) existingNudge.remove();
+            // 先检查缓存（interceptor 注入的数据最准确）
+            // Check cache first (interceptor data is most accurate)
+            if (handle) {
+                const cachedStatus = relationshipCache[handle] || relationshipCache[handle.toLowerCase()];
+                if (cachedStatus === 'mutual') {
+                    isMutual = true;
+                    iAmFollowing = true;
+                } else if (cachedStatus === 'not_following_back') {
+                    isMutual = false;
+                    iAmFollowing = true;
+                } else if (cachedStatus === 'following') {
+                    isMutual = false;
+                    iAmFollowing = true;
+                } else if (cachedStatus === 'following_me') {
+                    isMutual = false;
+                    iAmFollowing = false;
+                } else if (cachedStatus === 'none') {
+                    isMutual = false;
+                    iAmFollowing = false;
                 }
-            } else {
-                // 如果已回粉，移除提醒按钮（如果存在）
-                const existingNudge = cell.querySelector('.x-nudge-btn');
-                if (existingNudge) existingNudge.remove();
+                // cachedStatus === undefined → 缓存未命中，继续 DOM 判断
             }
 
+            // 缓存未命中时，从 DOM span 判断（兜底）
+            if (!relationshipCache[handle] && !relationshipCache[handle?.toLowerCase()]) {
+                const spans = Array.from(cell.querySelectorAll('span'));
+                iAmFollowing = spans.some(el =>
+                    el.textContent.trim() === '正在关注' ||
+                    el.textContent.trim() === 'Following'
+                );
+                isMutual = spans.some(el =>
+                    el.textContent.includes('关注了你') ||
+                    el.textContent.includes('Follows you')
+                );
+            }
+
+            // ── 决定是否显示「提醒」按钮 ──────────────────────────
+            // Decide whether to show "nudge" button
+            if (!isMutual && iAmFollowing) {
+                // 我关注了他，他没回 → 显示提醒按钮
+                if (handle) {
+                    notFollowingBackSet.add(handle.toLowerCase());
+                    injectNudgeButton(cell, handle);
+                }
+            } else {
+                const existingNudge = cell.querySelector('.x-nudge-btn');
+                if (existingNudge) existingNudge.remove();
+                if (!isMutual && !iAmFollowing) {
+                    if (handle) notFollowingBackSet.add(handle.toLowerCase());
+                } else {
+                    if (handle) notFollowingBackSet.delete(handle.toLowerCase());
+                }
+            }
+
+            // ── 筛选隐藏逻辑（用 CSS class 代替 display:none）──────
+            // Filter hiding logic (use CSS class instead of display:none)
             if (!isFilterActive) {
-                if (cell.style.display !== '') cell.style.display = '';
+                cell.classList.remove('x-filtered-out');
                 return;
             }
 
-            // 如果已经回粉（互关），则隐藏 (Hide if they follow back)
-            const targetDisplay = followsYou ? 'none' : '';
-            if (cell.style.display !== targetDisplay) {
-                cell.style.display = targetDisplay;
+            // 互关的用户隐藏（筛选出未回粉）
+            // Hide mutual followers (filter shows only non-followers)
+            if (isMutual) {
+                cell.classList.add('x-filtered-out');
+            } else {
+                cell.classList.remove('x-filtered-out');
             }
         });
 
-        // 更新按钮上的统计数字 (Update count on button)
-        const filterText = document.querySelector('.x-filter-follows-text');
+        // 更新悬浮按钮上的统计数字 / Update count on floating button
+        const filterText = document.querySelector('#x-float-filter-btn .x-filter-follows-text');
         if (filterText) {
-            filterText.textContent = `未回粉 (${nonFollowerCount})`;
+            const count = notFollowingBackSet.size;
+            filterText.textContent = count > 0 ? `未回粉 ${count}人` : '未回粉';
         }
+    };
+
+    // 用于跟踪已处理的推文，避免重复处理
+    let processedTweets = new WeakSet();
+
+    // =========================================================================
+    // === API 主动拉取与视口监控 (Active API Fetch & Viewport Watcher) =========
+    // =========================================================================
+
+    // 主动调用 X 的 v1.1 批量 API 查询关注状态（最高精确度，绝不漏标，防 429）/ Active batch fetch fallback
+    const fetchUsersRelationshipBatch = async (handles) => {
+        if (!handles || handles.length === 0) return null;
+        try {
+            const csrfToken = document.cookie.split('; ').find(row => row.startsWith('ct0='))?.split('=')[1];
+            if (!csrfToken) return null;
+
+            // 调用 X 原生 v1.1 获取多用户双向关系的专属接口，速度极快且必然包含 connections
+            // Support up to 100 screen_names per request
+            const screenNames = handles.slice(0, 100).join(',');
+            const url = `https://x.com/i/api/1.1/friendships/lookup.json?screen_name=${screenNames}`;
+
+            const response = await fetch(url, {
+                method: 'GET',
+                headers: {
+                    'authorization': 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
+                    'x-csrf-token': csrfToken,
+                    'x-twitter-active-user': 'yes',
+                    'x-twitter-auth-type': 'OAuth2Session',
+                    'x-twitter-client-language': 'en',
+                    'content-type': 'application/json'
+                },
+                credentials: 'include'
+            });
+
+            if (!response.ok) {
+                console.warn(`[X-Follow-Checker] 批量 API 查询失败，状态码: ${response.status}`);
+                return null;
+            }
+
+            const data = await response.json(); // Array of objects
+            const results = {};
+            if (Array.isArray(data)) {
+                data.forEach(user => {
+                    if (user.screen_name && user.connections) {
+                        results[user.screen_name.toLowerCase()] = {
+                            following: user.connections.includes('following'),
+                            followedBy: user.connections.includes('followed_by')
+                        };
+                    }
+                });
+            }
+            return results;
+        } catch (e) {
+            console.error('[X-Follow-Checker] Batch API Fetch Error:', e);
+            return null;
+        }
+    };
+
+    // 处理动态请求队列，按批次打包发送 / Process API queue in batches
+    let fetchQueueTimer = null;
+    const processFetchQueue = () => {
+        if (isFetchingAPI || pendingFetchQueue.size === 0) return;
+
+        if (fetchQueueTimer) clearTimeout(fetchQueueTimer);
+
+        const executeFetch = async () => {
+            if (pendingFetchQueue.size === 0) return;
+            isFetchingAPI = true;
+
+            // 取出最多 100 个进行查询 / Dequeue up to 100
+            const maxBatchSize = 100;
+            const batchHandles = [];
+            for (const handle of pendingFetchQueue) {
+                if (batchHandles.length >= maxBatchSize) break;
+                batchHandles.push(handle);
+                pendingFetchQueue.delete(handle);
+            }
+
+            console.log(`[X-Follow-Checker] 发起批量查询：共 ${batchHandles.length} 个用户`);
+            const statusDataMap = await fetchUsersRelationshipBatch(batchHandles);
+
+            if (statusDataMap) {
+                // 解析返回的数据
+                batchHandles.forEach(handle => {
+                    const handleLower = handle.toLowerCase();
+                    const statusData = statusDataMap[handleLower];
+
+                    if (statusData) {
+                        let status = 'none';
+                        if (statusData.following && statusData.followedBy) status = 'mutual';
+                        else if (statusData.following && !statusData.followedBy) status = 'following';
+                        else if (!statusData.following && statusData.followedBy) status = 'following_me';
+
+                        relationshipCache[handle] = status;
+                        relationshipCache[handleLower] = status;
+                        console.log(`[X-Follow-Checker] 批量补充成功: @${handle} -> ${status}`);
+                    } else {
+                        // 如果 X 没有返回这个人的 connections，视为非互关或无效用户，避免无限重试
+                        failedFetchSet.add(handleLower);
+                    }
+                });
+                saveCache();
+
+                // 主动批量更新已经出现在界面上的相关推文
+                const tweets = document.querySelectorAll('[data-testid="tweet"]');
+                tweets.forEach(tweet => {
+                    const tweetHandle = getHandle(tweet, true);
+                    if (tweetHandle) {
+                        const tweetHandleLower = tweetHandle.toLowerCase();
+                        if (statusDataMap[tweetHandleLower]) {
+                            const statusData = statusDataMap[tweetHandleLower];
+                            let status = 'none';
+                            if (statusData.following && statusData.followedBy) status = 'mutual';
+                            else if (statusData.following && !statusData.followedBy) status = 'following';
+                            else if (!statusData.following && statusData.followedBy) status = 'following_me';
+
+                            createOrUpdateLabel(tweet, status, false);
+                        }
+                    }
+                });
+            } else {
+                console.warn(`[X-Follow-Checker] 批量查询遭遇接口崩溃或限流，已防无限请求`);
+                batchHandles.forEach(h => failedFetchSet.add(h.toLowerCase()));
+            }
+
+            isFetchingAPI = false;
+            // 继续处理剩余队列
+            if (pendingFetchQueue.size > 0) {
+                processFetchQueue();
+            }
+        };
+
+        // 如果瞬时积压超过 40 人（滚动极快），直接发车；否则等 500ms
+        if (pendingFetchQueue.size >= 40) {
+            executeFetch();
+        } else {
+            fetchQueueTimer = setTimeout(executeFetch, 500);
+        }
+    };
+
+    // 初始化视口监控
+    const initViewportObserver = () => {
+        if (viewportObserver) return;
+        viewportObserver = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    const tweet = entry.target;
+                    const handle = getHandle(tweet, true);
+                    if (!handle) return;
+
+                    const handleLower = handle.toLowerCase();
+                    // 仅当明确缺失（undefined），且之前没查失败过时，才发请求
+                    if (relationshipCache[handleLower] === undefined && !failedFetchSet.has(handleLower)) {
+                        pendingFetchQueue.add(handle);
+                        processFetchQueue();
+                    }
+
+                    // 看过一次就可以停止监听，节省 CPU / Stop observing once it enters viewport once
+                    viewportObserver.unobserve(tweet);
+                }
+            });
+        }, {
+            rootMargin: '200px 0px', // 提前 200px 预加载，保证滚到脸上前标好了
+            threshold: 0.1
+        });
     };
 
     // 更新所有标签 / Update all labels
@@ -911,34 +1372,55 @@
         // 2. 处理 Tweets（时间线推文）/ Process Tweets (Timeline tweets)
         const tweets = document.querySelectorAll('[data-testid="tweet"]');
         tweets.forEach(tweet => {
-            const handle = getHandle(tweet);
-            if (!handle) return;
+            // 避免重复处理
+            if (processedTweets.has(tweet)) return;
 
-            // 从缓存读取状态 / Read status from cache
+            // 使用专用 tweet 模式提取作者 handle，避免引用推文污染
+            // Use tweet-specific mode to extract author handle (avoids quoted-tweet pollution)
+            const handle = getHandle(tweet, true);
+            if (!handle) {
+                processedTweets.add(tweet); // 无法获取 handle 的也标记为已处理
+                return;
+            }
+
+            // 先从缓存读取（interceptor 注入的数据最权威）
+            // Cache first (interceptor data is most authoritative)
             let status = relationshipCache[handle];
 
-            // 如果缓存中没有，检查是否有"关注了你"标签
-            // If not in cache, check for "Follows you" label
-            if (!status) {
-                const spans = Array.from(tweet.querySelectorAll('span'));
-                const followsYou = spans.some(
-                    el => el.textContent.includes('关注了你') ||
-                        el.textContent.includes('Follows you')
-                );
+            // 缓存明确标记为 'none'（未关注/无关系），跳过不标注
+            // Skip if cache explicitly says 'none' (not following / no relationship)
+            if (status === 'none') {
+                processedTweets.add(tweet);
+                return;
+            }
 
-                // 如果有"关注了你"，说明至少是互关
-                // If "Follows you" exists, it's at least mutual
-                if (followsYou) {
+            // 缓存未命中时，主动从推文 DOM 推断状态
+            // On cache miss, infer status directly from tweet DOM
+            if (!status) {
+                const domStatus = inferStatusFromTweetDOM(tweet);
+                if (domStatus === 'mutual' || domStatus === 'following_me') {
+                    // 确认互关 → 写入缓存 (Confirmed mutual → save to cache)
                     status = 'mutual';
                     relationshipCache[handle] = 'mutual';
                     changed = true;
+                } else if (domStatus === 'following') {
+                    // 我关注了他但对方未确认 → 临时显示 'following' 标签，不写缓存
+                    // I follow them but no confirmation they follow back → show 'following', don't cache
+                    status = 'following';
+                } else {
+                    // 如果完全没有记录（undefined），加入视口观察器探测队列，动态主动查询
+                    if (viewportObserver) viewportObserver.observe(tweet);
+                    // 为了防止 observer 死循环，仍然把它加到 processed 里去（API 查完会再次单独渲染）
+                    processedTweets.add(tweet);
+                    return; // 无法判断，跳过当前推文的标签更新
                 }
             }
 
-            // 只显示有明确状态的用户 / Only show users with confirmed status
+            // 只对有明确状态的推文标注 / Only label tweets with confirmed status
             if (status && status !== 'none') {
                 createOrUpdateLabel(tweet, status, false);
             }
+            processedTweets.add(tweet);
         });
 
         if (changed) {
@@ -949,20 +1431,38 @@
     // 防抖处理 / Debounce
     let debounceTimer;
     const debounceHighlight = () => {
+        // 筛选操作进行中时忽略 Observer 触发的更新，防止 CSS class 变更引发循环
+        // Ignore Observer-triggered updates during filter ops to prevent CSS class change loops
+        if (isApplyingFilter) return;
+
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
-            // 批量操作期间暂时断开观察，防止触发自身更新导致的死循环
-            // Disconnect during bulk ops to prevent infinite loops from self-triggered updates
-            if (typeof observer !== 'undefined') observer.disconnect();
+            if (isApplyingFilter) return; // 双重检查 / Double-check
 
-            updateAllLabels();
-            injectQuickReplyButton();
-            injectFilterButton();
-            applyFollowerFilter();
+            // 标记进入操作期间 / Mark operation in progress
+            isApplyingFilter = true;
 
-            // 操作完毕后恢复观察
+            // 断开 observer 并清空待处理队列，防止我们自己的 DOM 修改再次触发回调
+            // Disconnect and flush pending mutation queue to prevent our own DOM changes from re-triggering
             if (typeof observer !== 'undefined') {
-                observer.observe(document.body, { childList: true, subtree: true });
+                observer.takeRecords(); // 清空队列 / Flush queue
+                observer.disconnect();
+            }
+
+            try {
+                // 重置已处理推文集合，以便重新处理所有可见推文
+                // WeakSet 没有 clear() 方法，直接赋新对象重建
+                processedTweets = new WeakSet();
+                updateAllLabels();
+                injectQuickReplyButton();
+                injectFilterButton();
+                applyFollowerFilter();
+            } finally {
+                // 无论是否报错，都要恢复 / Always restore, even on error
+                isApplyingFilter = false;
+                if (typeof observer !== 'undefined') {
+                    observer.observe(document.body, { childList: true, subtree: true });
+                }
             }
         }, 300);
     };
